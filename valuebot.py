@@ -46,14 +46,14 @@ POLL_TIMEOUT = 50
 START_TS = time.time()
 
 MODEL_PREF = [
-    "gemini-3.8-flash",           # 2026-09 최신 Flash
-    "gemini-3.7-flash",           # 2026-08
+    "gemini-3.7-flash",           # 2026-08. 용량 안정화된 주력
+    "gemini-3.6-flash",           # 2026-07. 수요 분산용
+    "gemini-3.8-flash",           # 2026-09 최신. 신규라 503 잦음 → 후순위
     "gemini-flash-latest",        # 별칭 — 구글이 알아서 최신으로 포인팅
-    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.1-pro-preview",     # Pro 티어 (무료 한도 매우 타이트)
     "gemini-pro-latest",
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
 ]
 MODEL_BLOCK = re.compile(
@@ -62,7 +62,7 @@ MODEL_BLOCK = re.compile(
     re.I,
 )
 
-STATE = {"model": None, "candidates": [], "dead": set(), "offset": 0}
+STATE = {"model": None, "candidates": [], "dead": set(), "cooldown": {}, "offset": 0}
 
 
 def log(*a):
@@ -123,8 +123,8 @@ class QuotaExhausted(Exception):
     pass
 
 
-class ModelGone(Exception):
-    """404 — 목록에는 있으나 실제로는 호출 불가한 모델"""
+class Congested(Exception):
+    """503 — 구글 서버 용량 부족. 우리 잘못이 아님"""
     pass
 
 
@@ -174,6 +174,8 @@ def probe_model(name):
             return True, "ok"
         if r.status_code == 429:
             return True, "quota"      # 살아있음. 쿼터만 소진
+        if r.status_code in (500, 503, 529):
+            return True, "busy"       # 살아있음. 혼잡할 뿐
         return False, f"{r.status_code} {r.text[:120]}"
     except Exception as e:
         return False, str(e)[:120]
@@ -194,47 +196,95 @@ def select_model(exclude=None):
     return None
 
 
-def gemini_generate(parts, temperature=0.1, max_tokens=8192):
-    """404 발생 시 죽은 모델을 블랙리스트에 넣고 다음 후보로 자동 승계."""
-    for _switch in range(3):
-        model = STATE["model"]
-        if not model:
-            raise RuntimeError("사용 가능한 Gemini 모델이 없습니다.")
-        url = f"{GEM_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
-        body = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-                "responseMimeType": "application/json",
-            },
-        }
-        last = None
-        for attempt in range(3):
-            r = requests.post(url, json=body, timeout=300)
-            if r.status_code == 429:
-                raise QuotaExhausted(r.text[:300])
-            if r.status_code == 404:
-                log(f"404 on {model} — 블랙리스트 처리 후 승계")
-                STATE["dead"].add(model)
-                STATE["model"] = select_model(exclude=STATE["dead"])
-                last = "404"
-                break
-            if r.status_code == 200:
-                j = r.json()
-                try:
-                    cand = j["candidates"][0]
-                    return "".join(p.get("text", "") for p in cand["content"]["parts"])
-                except Exception:
-                    raise RuntimeError(f"unexpected response: {json.dumps(j)[:400]}")
-            last = f"{r.status_code} {r.text[:300]}"
-            if r.status_code in (500, 503):
-                time.sleep(4 * (attempt + 1))
+def alive_candidates():
+    now = time.time()
+    ok = [c for c in STATE["candidates"]
+          if c not in STATE["dead"] and STATE["cooldown"].get(c, 0) < now]
+    cur = STATE.get("model")
+    if cur in ok:                      # 현재 모델부터 시도
+        ok.remove(cur); ok.insert(0, cur)
+    return ok
+
+
+def gemini_generate(parts, temperature=0.1, max_tokens=8192, notify=None):
+    """
+    404 -> 영구 블랙리스트 후 다음 모델 승계
+    503 -> 해당 모델 5분 쿨다운 후 다음 모델로 넘어감 (구글 용량 문제)
+    한 바퀴 다 돌아도 전부 503이면 백오프 후 두 번째 바퀴까지 시도
+    """
+    tried, last_err = [], None
+
+    for round_no in range(2):
+        for model in alive_candidates():
+            if model in tried:
                 continue
-            break
-        if last != "404":
-            raise RuntimeError(last or "gemini failed")
-    raise RuntimeError("연속 404 — 모델 승계 실패")
+            tried.append(model)
+            url = f"{GEM_BASE}/models/{model}:generateContent?key={GEMINI_KEY}"
+            body = {
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {
+                    "temperature": temperature,
+                    "maxOutputTokens": max_tokens,
+                    "responseMimeType": "application/json",
+                },
+            }
+
+            for attempt in range(3):                  # 같은 모델 내 재시도
+                try:
+                    r = requests.post(url, json=body, timeout=300)
+                except Exception as e:
+                    last_err = f"network: {e}"
+                    time.sleep(5)
+                    continue
+
+                if r.status_code == 200:
+                    STATE["model"] = model            # 성공한 모델을 기본으로 승격
+                    try:
+                        cand = r.json()["candidates"][0]
+                        return "".join(p.get("text", "") for p in cand["content"]["parts"])
+                    except Exception:
+                        raise RuntimeError(f"unexpected response: {r.text[:300]}")
+
+                if r.status_code == 429:
+                    log(f"429 quota on {model} — 10분 쿨다운 후 다음 모델")
+                    STATE["cooldown"][model] = time.time() + 600
+                    last_err = "429"
+                    break
+
+                if r.status_code == 404:
+                    log(f"404 on {model} — 영구 제외")
+                    STATE["dead"].add(model)
+                    last_err = "404"
+                    break
+
+                if r.status_code in (500, 503, 529):
+                    wait = (5, 15, 30)[attempt]
+                    log(f"{r.status_code} on {model} — {wait}s 후 재시도 ({attempt+1}/3)")
+                    last_err = f"{r.status_code}"
+                    if attempt == 2:
+                        STATE["cooldown"][model] = time.time() + 300
+                        if notify:
+                            notify(f"⏳ <code>{model}</code> 혼잡 — 다른 모델로 전환 중…")
+                        break
+                    time.sleep(wait)
+                    continue
+
+                last_err = f"{r.status_code} {r.text[:200]}"
+                break
+
+        if round_no == 0 and last_err in ("503", "500", "529", "429"):
+            log("전 모델 혼잡 — 60초 대기 후 2차 시도")
+            if notify:
+                notify("⏳ 모든 모델 혼잡 상태입니다. 60초 후 재시도합니다…")
+            time.sleep(60)
+            STATE["cooldown"].clear()
+            tried = []
+
+    if last_err in ("503", "500", "529"):
+        raise Congested(", ".join(tried[:5]))
+    if last_err == "429":
+        raise QuotaExhausted(", ".join(tried[:5]))
+    raise RuntimeError(last_err or "gemini failed")
 
 
 def gemini_upload(data: bytes, mime: str, display_name: str) -> str:
@@ -662,7 +712,8 @@ HELP = """<b>밸류에이션 역산 봇</b>
 
 def analyze(chat_id, parts, filename, msg_id):
     tg("sendChatAction", chat_id=chat_id, action="typing")
-    raw = gemini_generate([{"text": EXTRACT_PROMPT}] + parts)
+    raw = gemini_generate([{"text": EXTRACT_PROMPT}] + parts,
+                          notify=lambda m: send(chat_id, m))
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
     try:
         data = json.loads(raw)
@@ -735,8 +786,19 @@ def handle(msg):
         elif text:
             send(chat_id, "보고서 PDF를 보내시거나 본문(200자 이상)을 붙여넣어 주세요. /help")
 
+    except Congested as e:
+        send(chat_id,
+             "🟠 <b>구글 서버 혼잡</b>\n\n"
+             "봇 오류가 아니라 Gemini 쪽 용량 부족입니다.\n"
+             f"시도한 모델: <code>{e}</code>\n\n"
+             "· 같은 파일을 몇 분 뒤 다시 보내시면 됩니다\n"
+             "· 급하시면 <code>/model gemini-3.1-pro-preview</code> 로 Pro 전환")
     except QuotaExhausted:
-        send(chat_id, "🔴 Gemini 무료 쿼터 소진. 잠시 후 다시 시도해 주세요.\n(이 봇 전용 키를 쓰고 있는지 확인 권장)")
+        send(chat_id,
+             "🔴 <b>무료 쿼터 소진</b>\n\n"
+             "모든 후보 모델의 일일/분당 한도를 넘었습니다.\n"
+             "· 분당 한도면 1~2분 뒤 재시도\n"
+             "· 일일 한도면 태평양시 자정에 초기화됩니다")
     except Exception as e:
         log("handle error:", traceback.format_exc())
         send(chat_id, f"❌ 처리 실패: <code>{str(e)[:300]}</code>")
