@@ -391,18 +391,84 @@ JSON만 출력하라. 다른 텍스트, 마크다운 코드펜스 금지."""
 # ----------------------------------------------------------------------------
 # 파이썬 검산 로직
 # ----------------------------------------------------------------------------
+DICT_FIELDS = ["stock", "report", "method", "per", "pbr", "ev_ebitda", "sotp_adjust", "dcf"]
+LIST_FIELDS = ["sotp", "earnings_drivers", "key_assumptions", "not_disclosed", "analyst_flags"]
+BULLET_FIELDS = ["earnings_drivers", "key_assumptions", "not_disclosed", "analyst_flags"]
+
+
+def as_text(v):
+    """dict/list가 섞여 와도 한 줄 문자열로 평탄화"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        return " / ".join(f"{k}: {as_text(x)}" for k, x in v.items() if x is not None)
+    if isinstance(v, list):
+        return " / ".join(as_text(x) for x in v if x is not None)
+    return str(v)
+
+
+def normalize(obj):
+    """LLM이 스키마를 어겨도 렌더링이 죽지 않도록 모양을 강제한다.
+    실제로 자주 발생: 객체를 배열로 감싸기, 단일값을 배열로 주기, 최상위를 배열로 주기."""
+    d = obj
+    if isinstance(d, list):                       # 최상위가 배열인 경우
+        d = next((x for x in d if isinstance(x, dict)), {})
+    if not isinstance(d, dict):
+        d = {}
+    out = dict(d)
+
+    for f in DICT_FIELDS:                         # dict여야 하는 필드
+        v = out.get(f)
+        if isinstance(v, list):
+            v = next((x for x in v if isinstance(x, dict)), {})
+        if not isinstance(v, dict):
+            v = {}
+        out[f] = v
+
+    for f in LIST_FIELDS:                         # list여야 하는 필드
+        v = out.get(f)
+        if v is None:
+            v = []
+        elif isinstance(v, dict):
+            v = [v] if f == "sotp" else [as_text(v)]
+        elif not isinstance(v, list):
+            v = [v]
+        out[f] = v
+
+    out["sotp"] = [x for x in out["sotp"] if isinstance(x, dict)]
+    for f in BULLET_FIELDS:
+        out[f] = [t for t in (as_text(x).strip() for x in out[f]) if t]
+
+    c = out.get("confidence")
+    out["confidence"] = c if isinstance(c, str) else "unknown"
+    return out
+
+
 def g(d, *keys, default=None):
+    """중간에 list가 끼어도 살아남는 안전 접근자"""
     cur = d
     for k in keys:
+        if isinstance(cur, list):
+            cur = next((x for x in cur if isinstance(x, dict)), None)
         if not isinstance(cur, dict):
             return default
         cur = cur.get(k)
+    if isinstance(cur, list):
+        cur = next((x for x in cur if x is not None), None)
     return cur if cur is not None else default
 
 
 def num(v):
+    if isinstance(v, bool):
+        return None
     if isinstance(v, (int, float)):
         return float(v)
+    if isinstance(v, list):
+        v = next((x for x in v if x is not None), None)
+    if isinstance(v, dict):
+        v = next((x for x in v.values() if isinstance(x, (int, float, str))), None)
     if isinstance(v, str):
         s = re.sub(r"[^\d.\-]", "", v)
         try:
@@ -613,7 +679,7 @@ def render(data, filename):
     L.append("")
 
     L.append(f"<b>1. 방법론</b>: {g(data,'method','primary') or '미확인'}")
-    desc = g(data, "method", "description")
+    desc = as_text(g(data, "method", "description")).strip()
     if desc:
         L.append(f"   {desc}")
     L.append("")
@@ -653,7 +719,7 @@ def render(data, filename):
         (("pbr", "rationale"), "근거(PBR)"),
         (("ev_ebitda", "rationale"), "근거(EV/EBITDA)"),
     ):
-        v = g(data, *path)
+        v = as_text(g(data, *path)).strip()
         if v:
             L.append(f"   • {lab}: {v}")
             got = True
@@ -670,7 +736,7 @@ def render(data, filename):
         if items:
             L.append(f"<b>{emoji}{title}</b>")
             for it in items[:6]:
-                L.append(f"   • {it}")
+                L.append(f"   • {as_text(it)}")
             L.append("")
 
     bullets("earnings_drivers", "5. 실적 가정 (목표주가의 전제)")
@@ -715,14 +781,40 @@ def analyze(chat_id, parts, filename, msg_id):
     raw = gemini_generate([{"text": EXTRACT_PROMPT}] + parts,
                           notify=lambda m: send(chat_id, m))
     raw = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip()
+
+    data = None
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            raise RuntimeError("JSON 파싱 실패")
-        data = json.loads(m.group(0))
-    send(chat_id, render(data, filename), reply_to=msg_id)
+        for pat in (r"\{.*\}", r"\[.*\]"):          # 배열 최상위도 허용
+            m = re.search(pat, raw, re.S)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                    break
+                except json.JSONDecodeError:
+                    continue
+    if data is None:
+        log("JSON parse failed. raw head:", raw[:500])
+        raise RuntimeError("모델이 JSON을 반환하지 않았습니다. 다시 시도해 주세요.")
+
+    data = normalize(data)
+
+    try:
+        send(chat_id, render(data, filename), reply_to=msg_id)
+    except Exception:
+        # 렌더링이 실패해도 추출 결과는 건네준다 (빈손보다 낫다)
+        log("render failed:", traceback.format_exc())
+        tp = num(g(data, "report", "target_price"))
+        brief = [
+            "⚠️ <b>정형 출력 실패 — 원시 추출값으로 대체</b>",
+            f"종목: {as_text(g(data, 'stock', 'name')) or '미상'}",
+            f"목표주가: {fmt(tp)}",
+            f"방법론: {as_text(g(data, 'method', 'primary')) or '미확인'}",
+            "",
+            "<pre>" + json.dumps(data, ensure_ascii=False, indent=1)[:2500] + "</pre>",
+        ]
+        send(chat_id, "\n".join(brief), reply_to=msg_id)
 
 
 def handle(msg):
